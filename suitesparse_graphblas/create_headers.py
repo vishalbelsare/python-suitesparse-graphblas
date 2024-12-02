@@ -21,6 +21,7 @@ things that may need to change are:
 Run `python create_headers.py --help` to see more help.
 
 """
+
 import argparse
 import os
 import re
@@ -261,6 +262,7 @@ DEPRECATED = {
 }
 
 DEFINES = {
+    "GrB_INDEX_MAX",
     "GxB_STDC_VERSION",
     "GxB_IMPLEMENTATION_MAJOR",
     "GxB_IMPLEMENTATION_MINOR",
@@ -275,8 +277,7 @@ DEFINES = {
     "GRB_SUBVERSION",
     "GxB_NTHREADS",
     "GxB_CHUNK",
-    "GxB_GPU_CONTROL",
-    "GxB_GPU_CHUNK",
+    "GxB_GPU_ID",
     "GxB_HYPERSPARSE",
     "GxB_SPARSE",
     "GxB_BITMAP",
@@ -290,6 +291,13 @@ DEFINES = {
     "GxB_BEGIN",
     "GxB_END",
     "GxB_INC",
+    "GxB_FAST_IMPORT",
+    "GxB_MAX_NAME_LEN",
+    "GxB_COMPRESSION_DEFAULT",
+    "GxB_COMPRESSION_LZ4",
+    "GxB_COMPRESSION_LZ4HC",
+    "GxB_COMPRESSION_ZSTD",
+    "GxB_COMPRESSION_NONE",
 }
 
 CHAR_DEFINES = {
@@ -306,12 +314,19 @@ IGNORE_DEFINES = {
     "GxB",
     "CMPLX",
     "CMPLXF",
+    "GB_GLOBAL",
+    "GB_HAS_CMPLX_MACROS",
     "GB_PUBLIC",
+    "GB_restrict",
     "GRAPHBLAS_H",
     "GrB_INVALID_HANDLE",
     "GrB_NULL",
     "GxB_SUITESPARSE_GRAPHBLAS",
     "NMACRO",
+    "RMM_WRAP_H",
+    "GXB_COMPLEX_H",
+    "GxB_STATIC_INLINE_VOID",
+    "GxB_HAVE_COMPLEX_C99",
     # deprecated
     "GxB_HYPER",
 }
@@ -320,6 +335,10 @@ IGNORE_LINES = {
     "GxB_cuda_calloc",
     "GxB_cuda_malloc",
     "GxB_cuda_free",
+}
+IGNORE_ENUMS = {
+    "memory_order",
+    "RMM_MODE",
 }
 
 
@@ -347,20 +366,22 @@ def get_groups(ast):
 
     seen = set()
     groups = {}
-    vals = {x for x in lines if "extern GrB_Info GxB" in x} - seen
+    vals = {x for x in lines if "GrB_Info GxB" in x} - seen
+    vals |= {x for x in lines if "GxB_Iterator" in x and "GB" not in x} - seen
     seen.update(vals)
     groups["GxB methods"] = sorted(vals, key=sort_key)
 
-    vals = {x for x in lines if "extern GrB_Info GrB" in x} - seen
+    vals = {x for x in lines if "GrB_Info GrB" in x} - seen
     seen.update(vals)
     groups["GrB methods"] = sorted(vals, key=sort_key)
 
-    vals = {x for x in lines if "extern GrB_Info GB" in x} - seen
+    vals = {x for x in lines if "GrB_Info GB" in x} - seen
+    vals |= {x for x in lines if "GxB_Iterator" in x and "GB" in x and "typedef" not in x} - seen
     seen.update(vals)
     groups["GB methods"] = sorted(vals, key=sort_key)
 
-    missing_methods = {x for x in lines if "extern GrB_Info " in x} - seen
-    assert not missing_methods
+    missing_methods = {x for x in lines if "GrB_Info " in x} - seen
+    assert not missing_methods, ", ".join(sorted(missing_methods))
 
     vals = {x for x in lines if "extern GrB" in x} - seen
     seen.update(vals)
@@ -379,7 +400,7 @@ def get_groups(ast):
     groups["GrB const"] = sorted(vals, key=sort_key)
 
     missing_const = {x for x in lines if "extern const" in x} - seen
-    assert not missing_const
+    assert not missing_const, ", ".join(sorted(missing_const))
 
     vals = {x for x in lines if "typedef" in x and "GxB" in x and "(" not in x} - seen
     seen.update(vals)
@@ -390,7 +411,7 @@ def get_groups(ast):
     groups["GrB typedef"] = sorted(vals, key=sort_key)
 
     missing_typedefs = {x for x in lines if "typedef" in x and "GB" in x and "(" not in x} - seen
-    assert not missing_typedefs
+    assert not missing_typedefs, ", ".join(sorted(missing_typedefs))
     assert all(x.endswith(";") for x in seen)  # sanity check
 
     g = VisitEnumTypedef()
@@ -408,14 +429,15 @@ def get_groups(ast):
     groups["GxB typedef enums"] = sorted(vals, key=lambda x: sort_key(x.rsplit("}", 1)[-1]))
 
     missing_enums = set(enums) - set(groups["GrB typedef enums"]) - set(groups["GxB typedef enums"])
-    assert not missing_enums
+    missing_enums = {x for x in missing_enums if not any(y in x for y in IGNORE_ENUMS)}
+    assert not missing_enums, ", ".join(sorted(missing_enums))
 
     vals = {x for x in lines if "typedef" in x and "GxB" in x} - seen
     seen.update(vals)
     groups["GxB typedef funcs"] = sorted(vals, key=sort_key)
 
     vals = {x for x in lines if "typedef" in x and "GrB" in x} - seen
-    assert not vals
+    assert not vals, ", ".join(sorted(vals))
     groups["not seen"] = sorted(set(lines) - seen, key=sort_key)
     for group in groups["not seen"]:
         assert "extern" not in group, group
@@ -564,11 +586,13 @@ def get_group_info(groups, ast, *, skip_complex=False):
             self.functions = []
 
         def visit_Decl(self, node):
-            if isinstance(node.type, c_ast.FuncDecl) and node.storage == ["extern"]:
+            if isinstance(node.type, c_ast.FuncDecl) and node.storage == []:
                 self.functions.append(node)
 
     def handle_function_node(node):
-        if generator.visit(node.type.type) != "GrB_Info":
+        if generator.visit(node.type.type) != "GrB_Info" and "GxB_Iterator" not in generator.visit(
+            node
+        ):
             raise ValueError(generator.visit(node))
         if node.name in DEPRECATED:
             return
@@ -582,11 +606,14 @@ def get_group_info(groups, ast, *, skip_complex=False):
             group = "vector"
         elif "GxB_Scalar" in text or "GrB_Scalar" in text:
             group = "scalar"
+        elif "GxB_Iterator" in text:
+            group = "iterator"
         else:
             group = node.name.split("_", 2)[1]
             group = {
                 # Apply our naming scheme
                 "GrB_Matrix": "matrix",
+                "Matrix": "matrix",
                 "GrB_Vector": "vector",
                 "GxB_Scalar": "scalar",
                 "SelectOp": "selectop",
@@ -598,6 +625,8 @@ def get_group_info(groups, ast, *, skip_complex=False):
                 "Type": "type",
                 "UnaryOp": "unary",
                 "IndexUnaryOp": "indexunary",
+                "Iterator": "iterator",
+                "Context": "context",
                 # "everything else" is "core"
                 "getVersion": "core",
                 "Global": "core",
@@ -606,6 +635,7 @@ def get_group_info(groups, ast, *, skip_complex=False):
                 "init": "core",
                 "wait": "core",
                 "deserialize": "core",
+                "Serialized": "core",  # Added in version 9
             }[group]
         return {
             "name": node.name,
@@ -620,9 +650,15 @@ def get_group_info(groups, ast, *, skip_complex=False):
     grb_nodes = [node for node in visitor.functions if node.name.startswith("GrB_")]
     gxb_nodes = [node for node in visitor.functions if node.name.startswith("GxB_")]
     gb_nodes = [node for node in visitor.functions if node.name.startswith("GB_")]
-    assert len(grb_nodes) == len(groups["GrB methods"])
-    assert len(gxb_nodes) == len(groups["GxB methods"])
-    assert len(gb_nodes) == len(groups["GB methods"])
+    assert len(grb_nodes) == len(groups["GrB methods"]), (
+        len(grb_nodes),
+        len(groups["GrB methods"]),
+    )
+    assert len(gxb_nodes) == len(groups["GxB methods"]), (
+        len(gxb_nodes),
+        len(groups["GxB methods"]),
+    )
+    assert len(gb_nodes) == len(groups["GB methods"]), (len(gb_nodes), len(groups["GB methods"]))
 
     grb_funcs = (handle_function_node(node) for node in grb_nodes)
     gxb_funcs = (handle_function_node(node) for node in gxb_nodes)
@@ -732,7 +768,7 @@ def create_header_text(groups, *, char_defines=None, defines=None):
     return text
 
 
-def create_source_text(*, char_defines=None):
+def create_source_text(groups, *, char_defines=None):
     if char_defines is None:
         char_defines = CHAR_DEFINES
     text = [
@@ -749,7 +785,7 @@ def main():
     parser.add_argument(
         "--graphblas",
         help="Path to GraphBLAS.h of SuiteSparse.  Default will look in Python prefix path.",
-        default=os.path.join(sys.prefix, "include", "GraphBLAS.h"),
+        default=os.path.join(sys.prefix, "include", "suitesparse", "GraphBLAS.h"),
     )
     parser.add_argument(
         "--show-skipped",
@@ -766,6 +802,7 @@ def main():
 
     # final files used by cffi (with and without complex numbers)
     final_h = os.path.join(thisdir, "suitesparse_graphblas.h")
+    # final_arm64_h = os.path.join(thisdir, "suitesparse_graphblas_arm64.h")
     final_no_complex_h = os.path.join(thisdir, "suitesparse_graphblas_no_complex.h")
     source_c = os.path.join(thisdir, "source.c")
 
@@ -791,20 +828,30 @@ def main():
     groups = parse_header(processed_h, skip_complex=False)
     text = create_header_text(groups)
     with open(final_h, "w") as f:
-        f.write("\n".join(text))
+        f.write("\n".join(text) + "\n")
+
+    # NOTE:suitesparse_graphblas.h and suitesparse_graphblas_arm64.h are the same now
+    # # Create final header file (arm64)
+    # # Replace all variadic arguments (...) with "char *"
+    # print(f"Step 4: parse header file to create {final_arm64_h}")
+    # orig_text = text
+    # patt = re.compile(r"^(extern GrB_Info .*\(.*)(\.\.\.)(\);)$")
+    # text = [patt.sub(r"\1char *\3", line) for line in orig_text]
+    # with open(final_arm64_h, "w") as f:
+    #     f.write("\n".join(text) + "\n")
 
     # Create final header file (no complex)
     print(f"Step 4: parse header file to create {final_no_complex_h}")
     groups_no_complex = parse_header(processed_h, skip_complex=True)
     text = create_header_text(groups_no_complex)
     with open(final_no_complex_h, "w") as f:
-        f.write("\n".join(text))
+        f.write("\n".join(text) + "\n")
 
     # Create source
     print(f"Step 5: create {source_c}")
-    text = create_source_text()
+    text = create_source_text(groups)
     with open(source_c, "w") as f:
-        f.write("\n".join(text))
+        f.write("\n".join(text) + "\n")
 
     # Check defines
     print("Step 6: check #define definitions")

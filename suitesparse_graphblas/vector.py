@@ -1,5 +1,8 @@
 from suitesparse_graphblas import check_status, ffi, lib
 
+from .io.serialize import deserialize_vector as deserialize  # noqa: F401
+from .io.serialize import serialize_vector as serialize  # noqa: F401
+
 
 def free(v):
     """Free a vector."""

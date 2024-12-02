@@ -90,7 +90,7 @@ def binwrite(A, filename, comments=None, opener=Path.open):
     if isinstance(filename, str):
         filename = Path(filename)
 
-    check_status(A, lib.GrB_Matrix_wait(A))
+    check_status(A, lib.GrB_Matrix_wait(A[0], lib.GrB_MATERIALIZE))
 
     ffinew = ffi.new
 
@@ -124,7 +124,6 @@ def binwrite(A, filename, comments=None, opener=Path.open):
 
     typecode = ffinew("int32_t*")
     matrix_type = ffi.new("GrB_Type*")
-    sparsity_status = ffinew("int32_t*")
 
     nrows[0] = matrix.nrows(A)
     ncols[0] = matrix.ncols(A)
@@ -243,7 +242,7 @@ def binwrite(A, filename, comments=None, opener=Path.open):
         f"{lib.GxB_IMPLEMENTATION_SUB}"
     )
 
-    vars = dict(
+    vars = dict(  # noqa: C408
         suitesparse_version=suitesparse_version,
         user_agent="pygraphblas-" + __version__,
         nrows=nrows[0],

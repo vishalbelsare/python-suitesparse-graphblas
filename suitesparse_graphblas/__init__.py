@@ -1,12 +1,58 @@
-from . import _version
+import importlib.metadata
+import platform
+import struct as _struct
+
 from . import exceptions as ex
 from . import utils
-from ._graphblas import ffi, lib  # noqa
+from ._graphblas import ffi, lib
+
+_is_osx_arm64 = platform.machine() == "arm64"
+_is_ppc64le = platform.machine() == "ppc64le"
+_c_float = ffi.typeof("float")
+_c_double = ffi.typeof("double")
+
+try:
+    __version__ = importlib.metadata.version("suitesparse-graphblas")
+except Exception as exc:  # pragma: no cover (safety)
+    raise AttributeError(
+        "`suitesparse_graphblas.__version__` not available. This may mean "
+        "suitesparse-graphblas was incorrectly installed or not installed at all. "
+        "For local development, you may want to do an editable install via "
+        "`python -m pip install -e path/to/suitesparse-graphblas`"
+    ) from exc
+del importlib, platform
+
+# It is strongly recommended to use the non-variadic version of functions to be
+# compatible with the most number of architectures. For example, you should use
+# GxB_Matrix_Option_get_INT32 instead of GxB_Matrix_Option_get.
+if _is_osx_arm64 or _is_ppc64le:
+
+    def vararg(val):
+        # Interpret float as int32 and double as int64
+        # https://devblogs.microsoft.com/oldnewthing/20220823-00/?p=107041
+        tov = ffi.typeof(val)
+        if tov == _c_float:
+            val = _struct.unpack("l", _struct.pack("f", val))[0]
+            val = ffi.cast("int64_t", val)
+        elif tov == _c_double:
+            val = _struct.unpack("q", _struct.pack("d", val))[0]
+            val = ffi.cast("int64_t", val)
+        # Cast variadic argument as char * to force it onto the stack where ARM64 expects it
+        # https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms
+        #
+        # The same fix *may* work for ppc64le
+        return ffi.cast("char *", val)
+
+else:
+
+    def vararg(val):
+        return val
 
 
 def is_initialized():
     """Is GraphBLAS initialized via GrB_init or GxB_init?"""
-    return lib.GxB_Global_Option_get(lib.GxB_MODE, ffi.new("GrB_Mode*")) != lib.GrB_PANIC
+    mode = ffi.new("int32_t*")
+    return lib.GxB_Global_Option_get_INT32(lib.GxB_MODE, mode) != lib.GrB_PANIC
 
 
 def supports_complex():
@@ -44,6 +90,9 @@ def initialize(*, blocking=False, memory_manager="numpy"):
         lib.GrB_init(blocking)
     else:
         raise ValueError(f'memory_manager argument must be "numpy" or "c"; got: {memory_manager!r}')
+    # See: https://github.com/GraphBLAS/python-suitesparse-graphblas/issues/40
+    for attr in dir(lib):
+        getattr(lib, attr)
 
 
 def libget(name):
@@ -114,11 +163,15 @@ _error_code_lookup = {
     lib.GrB_DOMAIN_MISMATCH: ex.DomainMismatch,
     lib.GrB_DIMENSION_MISMATCH: ex.DimensionMismatch,
     lib.GrB_OUTPUT_NOT_EMPTY: ex.OutputNotEmpty,
+    lib.GrB_EMPTY_OBJECT: ex.EmptyObject,
     # Execution Errors
     lib.GrB_OUT_OF_MEMORY: ex.OutOfMemory,
     lib.GrB_INSUFFICIENT_SPACE: ex.InsufficientSpace,
     lib.GrB_INDEX_OUT_OF_BOUNDS: ex.IndexOutOfBound,
     lib.GrB_PANIC: ex.Panic,
+    lib.GrB_NOT_IMPLEMENTED: ex.NotImplementedException,
+    # GxB Errors
+    lib.GxB_EXHAUSTED: StopIteration,
 }
 GrB_SUCCESS = lib.GrB_SUCCESS
 GrB_NO_VALUE = lib.GrB_NO_VALUE
@@ -128,7 +181,6 @@ _error_func_lookup = {
     "struct GB_Type_opaque *": lib.GrB_Type_error,
     "struct GB_UnaryOp_opaque *": lib.GrB_UnaryOp_error,
     "struct GB_BinaryOp_opaque *": lib.GrB_BinaryOp_error,
-    "struct GB_SelectOp_opaque *": lib.GxB_SelectOp_error,
     "struct GB_Monoid_opaque *": lib.GrB_Monoid_error,
     "struct GB_Semiring_opaque *": lib.GrB_Semiring_error,
     "struct GB_Scalar_opaque *": lib.GxB_Scalar_error,
@@ -168,4 +220,85 @@ def check_status(obj, response_code):
     raise _error_code_lookup[response_code](text)
 
 
-__version__ = _version.get_versions()["version"]
+class burble:
+    """Control diagnostic output, and may be used as a context manager.
+
+    Set up and simple usage:
+
+    >>> from suitesparse_graphblas import burble, lib, matrix
+    >>>
+    >>> A = matrix.new(lib.GrB_BOOL, 3, 3)
+    >>> burble.is_enabled
+    False
+    >>> burble.enable()
+    >>> burble.is_enabled
+    True
+    >>> burble.disable()
+
+    Example with explicit enable and disable:
+
+    >>> burble.enable()
+    >>> n = matrix.nvals(A)
+      [ GrB_Matrix_nvals
+         1.91e-06 sec ]
+    >>> burble.disable()
+
+    Example as a context manager:
+
+    >>> with burble():
+    >>>     n = matrix.nvals(A)
+      [ GrB_Matrix_nvals
+         1.91e-06 sec ]
+
+    """
+
+    def __init__(self):
+        self._states = []
+
+    @property
+    def is_enabled(self):
+        """Is burble enabled?"""
+        val_ptr = ffi.new("int32_t*")
+        info = lib.GxB_Global_Option_get_INT32(lib.GxB_BURBLE, val_ptr)
+        if info != lib.GrB_SUCCESS:
+            raise _error_code_lookup[info](
+                "Failed to get burble status (has GraphBLAS been initialized?"
+            )
+        return val_ptr[0]
+
+    def enable(self):
+        """Enable diagnostic output"""
+        info = lib.GxB_Global_Option_set_INT32(lib.GxB_BURBLE, ffi.cast("int32_t", 1))
+        if info != lib.GrB_SUCCESS:
+            raise _error_code_lookup[info](
+                "Failed to enable burble (has GraphBLAS been initialized?"
+            )
+
+    def disable(self):
+        """Disable diagnostic output"""
+        info = lib.GxB_Global_Option_set_INT32(lib.GxB_BURBLE, ffi.cast("int32_t", 0))
+        if info != lib.GrB_SUCCESS:
+            raise _error_code_lookup[info](
+                "Failed to disable burble (has GraphBLAS been initialized?"
+            )
+
+    def __enter__(self):
+        is_enabled = self.is_enabled
+        if not is_enabled:
+            self.enable()
+        self._states.append(is_enabled)
+        return self
+
+    def __exit__(self, type_, value, traceback):
+        is_enabled = self._states.pop()
+        if not is_enabled:
+            self.disable()
+
+    def __reduce__(self):
+        return "burble"
+
+    def __repr__(self):
+        return f"<burble is_enabled={self.is_enabled}>"
+
+
+burble = burble()

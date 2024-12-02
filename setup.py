@@ -3,9 +3,11 @@ import sys
 from glob import glob
 
 import numpy as np
-from setuptools import Extension, find_packages, setup
+from setuptools import Extension, setup
 
-import versioneer
+# Add current directory to the Python path because it's not present when running `pip install .`
+sys.path.append(os.path.dirname(__file__))
+import build_graphblas_cffi  # noqa: E402 # isort:skip
 
 try:
     from Cython.Build import cythonize
@@ -15,9 +17,14 @@ try:
 except ImportError:
     use_cython = False
 
-
-is_win = sys.platform.startswith("win")
 define_macros = [("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")]
+
+# /d2FH4- flag needed only for early Python 3.8 builds on Windows.
+# See https://cibuildwheel.readthedocs.io/en/stable/faq/
+# (Search for flag on page. Full link is long and causes the linter to fail the tests.)
+#
+# The /std:c11 flag is because the MSVC default is C89.
+extra_compile_args = ["/d2FH4-", "/std:c11"] if sys.platform == "win32" else []
 
 if use_cython:
     suffix = ".pyx"
@@ -44,38 +51,17 @@ ext_modules = [
         [name],
         include_dirs=include_dirs,
         define_macros=define_macros,
+        extra_compile_args=extra_compile_args,
     )
     for name in glob(f"suitesparse_graphblas/**/*{suffix}", recursive=True)
 ]
 if use_cython:
     ext_modules = cythonize(ext_modules, include_path=include_dirs)
 
-with open("README.md") as f:
-    long_description = f.read()
-
-package_data = {"suitesparse_graphblas": ["*.pyx", "*.pxd", "*.c", "*.h"]}
-if is_win:
-    package_data["suitesparse_graphblas"].append("*.dll")
+if build_graphblas_cffi.is_win:
+    ext_modules.append(build_graphblas_cffi.get_extension(extra_compile_args=extra_compile_args))
 
 setup(
-    name="suitesparse-graphblas",
-    version=versioneer.get_version(),
-    cmdclass=versioneer.get_cmdclass(),
-    description="SuiteSparse:GraphBLAS Python bindings.",
-    long_description=long_description,
-    long_description_content_type="text/markdown",
-    packages=find_packages(),
-    author="Michel Pelletier, James Kitchen, Erik Welch",
-    author_email="michel@graphegon.com,jim22k@gmail.com,erik.n.welch@gmail.com",
-    url="https://github.com/GraphBLAS/python-suitesparse-graphblas",
     ext_modules=ext_modules,
-    cffi_modules=["suitesparse_graphblas/build.py:ffibuilder"],
-    python_requires=">=3.7",
-    install_requires=["cffi>=1.0.0", "numpy>=1.17"],
-    setup_requires=["cffi>=1.0.0", "pytest-runner"],
-    tests_require=["pytest"],
-    license="Apache License 2.0",
-    package_data=package_data,
-    include_package_data=True,
-    zip_safe=False,
+    cffi_modules=None if build_graphblas_cffi.is_win else ["build_graphblas_cffi.py:ffibuilder"],
 )
